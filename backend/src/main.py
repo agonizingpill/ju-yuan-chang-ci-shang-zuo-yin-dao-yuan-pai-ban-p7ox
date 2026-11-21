@@ -13,6 +13,8 @@ from .services import get,pack,audit,history,validate_history,invalidate,save_cr
 from .middlewares import RequestTrace,BurstGuard
 from .frontdesk_routes import router as frontdesk_router
 from .house_routes import router as house_router
+from .group_routes import router as group_router
+from .group_service import ensure_reconciled
 from .constants import ROLES,PERFORMANCE_STATES,CALL_STATES
 r=redis.Redis.from_url(os.environ['REDIS_URL'],decode_responses=True)
 @asynccontextmanager
@@ -27,6 +29,7 @@ async def lifespan(app):
 app=FastAPI(title='南岸 · 场次上座与场务点名',lifespan=lifespan)
 app.include_router(frontdesk_router)
 app.include_router(house_router)
+app.include_router(group_router)
 app.add_middleware(RequestTrace);app.add_middleware(BurstGuard)
 @app.exception_handler(IntegrityError)
 async def conflict(req,exc):return JSONResponse({'detail':'剧目编号、场次日期或点名单重复，请选择已有记录修订'},409)
@@ -62,12 +65,13 @@ def add_performance(p:PerformanceInput,s=Depends(db_session),u=Depends(writers))
     prod=get(s,Production,p.production_id)
     if p.arrivals is not None and p.arrivals>prod.seats:raise HTTPException(409,'验票人数超过本场座位容量')
     invalidate(s,prod)
-    v=Performance(**p.model_dump(),status='observed' if p.arrivals is not None else 'scheduled');s.add(v);audit(s,u,'登记场次 '+p.date.isoformat());s.commit();return pack(v)
+    v=Performance(**p.model_dump(),status='observed' if p.arrivals is not None else 'scheduled');s.add(v);s.flush();ensure_reconciled(s,v.id,p.arrivals);audit(s,u,'登记场次 '+p.date.isoformat());s.commit();return pack(v)
 @app.patch('/performances/{fid}/arrivals')
 def arrivals(fid:int,p:ArrivalInput,s=Depends(db_session),u=Depends(writers)):
     perf=get(s,Performance,fid);prod=get(s,Production,perf.production_id)
     if p.arrivals>prod.seats:raise HTTPException(409,'验票人数超过本场座位容量')
     if perf.arrivals is None:raise HTTPException(409,'未来预测场次不能直接写验票；请通过新场次补录历史')
+    ensure_reconciled(s,perf.id,p.arrivals)
     invalidate(s,prod);perf.arrivals=p.arrivals;audit(s,u,'修订验票 '+str(perf.date));s.commit();return pack(perf)
 @app.post('/productions/{pid}/forecast')
 def forecast(pid:int,s=Depends(db_session),u=Depends(writers)):
